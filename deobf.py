@@ -1,4 +1,5 @@
 import re
+import json
 
 import idautils
 import idc
@@ -14,16 +15,16 @@ import idc
 
 regex_mov = re.compile('MOV +PC, (R[0-9]+)')
 regex_ldrw = re.compile('LDR\\.W +(R[0-9]+), \\[(R[0-9]+),(R[0-9]+),(LSL#2)\\]')
-regex_table = re.compile('ADD +(R[0-9]+), PC')
+regex_table = re.compile('ADD +(R[0-9]+), PC; (.*?)$')
 
 
-def search(search_method, addr, addr_end, regexp):
+def search(next_addr, addr, addr_end, regexp):
     while True:
         asm = idc.GetDisasm(addr)
         asm_match = regexp.match(asm)
-        if regexp.match(asm):
+        if asm_match:
             return addr, asm_match
-        addr = search_method(addr, addr_end)
+        addr = next_addr(addr, addr_end)
         if addr == idc.BADADDR:
             return None, None
 
@@ -36,6 +37,38 @@ def search_backward(addr, addr_end, regexp):
     return search(idc.PrevHead, addr, addr_end, regexp)
 
 
+def search_register_modifier(next_addr, addr, addr_end, register):
+    while True:
+        if idc.GetOpnd(addr, 0) == register:
+            return addr
+        addr = next_addr(addr, addr_end)
+        if addr == idc.BADADDR:
+            return None
+
+
+def search_register_modifier_forward(addr, addr_end, register):
+    return search_register_modifier(idc.NextHead, addr, addr_end, register)
+
+
+def search_register_modifier_backward(addr, addr_end, register):
+    return search_register_modifier(idc.PrevHead, addr, addr_end, register)
+
+
+def name_to_address(name):
+    for ida_name in idautils.Names():
+        if ida_name[1] == name:
+            return ida_name[0]
+
+    return None
+
+
+def xrefs_count(ea):
+    count = 0
+    for _ in idautils.XrefsTo(ea):
+        count += 1
+    return count
+
+
 def deobfuscate_function(addr):
     if addr != idc.FirstFuncFchunk(addr):
         print "[DEOBF] Address %X is not the start of a function." % addr
@@ -45,64 +78,61 @@ def deobfuscate_function(addr):
     func_start = addr
     func_end = idc.FindFuncEnd(addr)
 
-    # Identified by first.
-    is_first = True
-    state_register = None
+    # 1. Find MOV PC
+    (mov_addr, mov_match) = search_forward(func_start, func_end, regex_mov)
 
-    # Changes.
-    current_addr = addr
+    if mov_addr is None:
+        # print "[DEOBF] No MOV PC was found in %s" % idc.GetFunctionName(func_start)
+        return
 
-    # TODO: "Rewrite"
-    #   1 Find MOV PC ..
-    #   2 Find LDR.W ..
-    #   3 Find table offset
-    #   4 Find subroutine boundary
-    #   5 Iterate through the table
+    # 2. Find LDR.W ..
+    ldr_addr = search_register_modifier_backward(mov_addr, func_start, mov_match.group(1))
+    ldr_match = regex_ldrw.match(idc.GetDisasm(ldr_addr)) if ldr_addr is not None else None
 
-    # Need to make sure that all the subs connect to each other with nothing inbetween.
+    if ldr_addr is None:
+        print "[DEOBF] No LDR.W was found in %s" % idc.GetFunctionName(func_start)
+        return
+
+    if ldr_match is None:
+        print "[DEOBF] Modifier of %s found from %X is not a LDR.W" % (mov_match.group(1), mov_addr)
+        return
+
+    # 3. Find table offset
+    add_addr = search_register_modifier_backward(ldr_addr, func_start, ldr_match.group(2))
+    # add_match = regex_table.match(idc.GetDisasm(add_addr)) if add_addr is not None else None
+    #
+    # print idc.GetEnum(add_match.group(2) + 'asd')
+
+    if add_addr is None:
+        # TODO: Check if belongs to a previously found graph.
+        # print "[DEOBF] No ADD was found above %X" % ldr_addr
+        return
+
+    if idc.GetOpnd(add_addr, 1) != 'PC':
+        print "[DEOBF] ADD does not use PC at %X" % add_addr
+        return
+
+    ldr2_addr = search_register_modifier_backward(idc.PrevHead(add_addr), func_start, idc.GetOpnd(add_addr, 0))
+
+    opp_val = idc.GetOperandValue(ldr2_addr, 1)     # Address to loc_80054
+    opp_val = idc.Dword(opp_val)                    # loc_80054
+    opp_val = opp_val + idc.NextHead(add_addr) + 2  # Address of the table.
+
+    # 4. Read table.
+    table = []
+    table_addr = opp_val
 
     while True:
-        # Search for the next mov instruction that changes PC.
-        (mov_addr, mov_match) = search_forward(current_addr, func_end, regex_mov)
-
-        if mov_addr is None:
-            if not is_first:
-                print "[DEOBF] No more messy stuff in function %s" % idc.GetFunctionName(func_start)
+        table_entry = idc.Dword(table_addr)
+        if table_entry > 0:
+            table.append(table_entry)
+        table_addr = table_addr + 4
+        if xrefs_count(table_addr) > 0:
             break
 
-        # print "[DEOBF] Messy at 0x%x" % mov_addr
+    # TODO: 5. Find subroutine boundary
 
-        # Parse state information.
-        (state_addr, state_match) = search_backward(mov_addr, func_start, regex_ldrw)
-
-        if state_match is None:
-            print "[DEOBF] Failed to find state at %X" % mov_addr
-            break
-
-        # Verify state information.
-        if is_first:
-            is_first = False
-            state_register = state_match.group(2)
-            (table_addr, table_match) = search_backward(state_addr, func_start, regex_table)
-            # Verify table.
-
-        elif state_register != state_match.group(2):
-            print "[DEOBF] state_register mismatch (%s!=%s) at %X" % (state_register, state_match.group(2), mov_addr)
-            break
-
-        # Verify state belongs to mov.
-        if state_match.group(1) != mov_match.group(1):
-            print "[DEOBF] mov & state mismatch (%s!=%s) at %X" % (state_match.group(1), state_match.group(1), mov_addr)
-            break
-
-        # Calculate destination.
-        calced_addr = 0
-
-        idc.MakeComm(mov_addr, 'Should jump to %X' % calced_addr)
-
-        # Keep looking.
-        # TODO: Conditional / branch properly. Should propably turn this while loop into a recursive function.
-        current_addr = idc.NextHead(mov_addr)
+    # TODO: 6. Iterate through the table
 
 
 print "[DEOBF] ===================================="
@@ -111,9 +141,13 @@ print "[DEOBF] ===================================="
 #     # TODO: Deobf all the functions.
 #     deobfuscate_function(func)
 
-for entry in idautils.Entries():
-    if entry[3] == "JNI_OnLoad":
-        print "[DEOBF] Found JNI_OnLoad at %X" % entry[2]
-        deobfuscate_function(entry[2])
+# for entry in idautils.Entries():
+#     if entry[3] == "JNI_OnLoad" or entry[3] == "sub_F3C4" or entry[3] == "sub_F580":
+#         print "[DEOBF] Found JNI_OnLoad at %X" % entry[2]
+#         deobfuscate_function(entry[2])
+
+deobfuscate_function(0x24B24)  # JNI_OnLoad
+# deobfuscate_function(0xF3C4)
+# deobfuscate_function(0xF580)
 
 print "[DEOBF] Finished."
