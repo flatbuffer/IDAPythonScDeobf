@@ -54,21 +54,6 @@ def search_register_modifier_backward(addr, addr_end, register):
     return search_register_modifier(idc.PrevHead, addr, addr_end, register)
 
 
-def name_to_address(name):
-    for ida_name in idautils.Names():
-        if ida_name[1] == name:
-            return ida_name[0]
-
-    return None
-
-
-def xrefs_count(ea):
-    count = 0
-    for _ in idautils.XrefsTo(ea):
-        count += 1
-    return count
-
-
 def deobfuscate_function(addr):
     if addr != idc.FirstFuncFchunk(addr):
         print "[DEOBF] Address %X is not the start of a function." % addr
@@ -127,7 +112,7 @@ def deobfuscate_function(addr):
         if table_entry > 0:
             table.append(table_entry)
         table_addr = table_addr + 4
-        if xrefs_count(table_addr) > 0:
+        if idc.Name(table_addr):
             break
 
     # TODO: 5. Find subroutine boundary
