@@ -1,6 +1,7 @@
 import re
 import json
 
+import idaapi
 import idautils
 import idc
 
@@ -52,6 +53,94 @@ def search_register_modifier_forward(addr, addr_end, register):
 
 def search_register_modifier_backward(addr, addr_end, register):
     return search_register_modifier(idc.PrevHead, addr, addr_end, register)
+
+
+def find_subroutine_boundary(table_addr, table):
+    # Find all basic blocks.
+    ranges = set()
+    ida_functions = set()  # Storing all functions found so we can use it to verify results later.
+
+    # Find all functions and blocks from the table.
+    for entry in table:
+        ida_func = idaapi.get_func(entry)
+        ida_functions.add(ida_func.start_ea)
+
+        ida_fc = idaapi.FlowChart(ida_func)
+        ida_block = None
+
+        # Find the block that belongs to this table entry.
+        for ida_block_entry in ida_fc:
+            if ida_block_entry.start_ea == entry:
+                ida_block = ida_block_entry
+                break
+
+        if ida_block is None:
+            print "[DEOBF] Unable to find block of %X" % entry
+            return None, None
+
+        brange = (ida_block.start_ea, ida_block.end_ea)
+
+        if brange in ranges:
+            print "[DEOBF] Found duplicate block usage at %X" % entry
+            return None, None
+
+        ranges.add(brange)
+
+    # Make sure that every block of every function is found and in the table.
+    miss_count = 0
+
+    for ida_function in ida_functions:
+        for ida_block in idaapi.FlowChart(idaapi.get_func(ida_function)):
+            # Check if this block is in the table.
+            found = False
+
+            for brange in ranges:
+                if brange[0] == ida_block.start_ea:
+                    found = True
+                    break
+
+            if not found:
+                if miss_count == 0 \
+                        and ida_block.end_ea - ida_block.start_ea == 4\
+                        and idc.GetMnem(ida_block.start_ea) == 'BLX':
+                    print "[DEOBF] Found unimportant block at %X in table %X" % (ida_block.start_ea, table_addr)
+                    miss_count += 1
+                    continue
+
+                print "[DEOBF] Found unused block at %X in table %X" % (ida_block.start_ea, table_addr)
+                return None, None
+
+    # Make sure every function connects.
+    sub_start = None
+    sub_end = None
+
+    if len(ida_functions) > 1:
+        for func_a in ida_functions:
+            found_connection = False
+            ida_func_a = idaapi.get_func(func_a)
+
+            if sub_start is None or sub_start > ida_func_a.start_ea:
+                sub_start = ida_func_a.start_ea
+
+            if sub_end is None or sub_end < ida_func_a.end_ea:
+                sub_end = ida_func_a.end_ea
+
+            for func_b in ida_functions:
+                ida_func_b = idaapi.get_func(func_b)
+
+                if ida_func_a.start_ea == ida_func_b.end_ea \
+                        or ida_func_a.end_ea == ida_func_b.start_ea:
+                    found_connection = True
+                    break
+            if not found_connection:
+                print "[DEOBF] Found disconnected function %X in table %X" % (ida_func_a.start_ea, table_addr)
+                return None, None
+    else:
+        ida_func = idaapi.get_func(list(ida_functions)[0])
+        sub_start = ida_func.start_ea
+        sub_end = ida_func.end_ea
+
+    return sub_start, sub_end
 
 
 def deobfuscate_function(addr):
@@ -115,7 +204,13 @@ def deobfuscate_function(addr):
         if idc.Name(table_addr):
             break
 
-    # TODO: 5. Find subroutine boundary
+    # - We also have to add the starting block to the table.
+    table.append(func_start)
+
+    # 5. Find subroutine boundary
+    (sub_start, sub_end) = find_subroutine_boundary(opp_val, table)
+
+    print "Start: %X - End: %X" % (sub_start, sub_end)
 
     # TODO: 6. Iterate through the table
 
@@ -130,6 +225,9 @@ print "[DEOBF] ===================================="
 #     if entry[3] == "JNI_OnLoad" or entry[3] == "sub_F3C4" or entry[3] == "sub_F580":
 #         print "[DEOBF] Found JNI_OnLoad at %X" % entry[2]
 #         deobfuscate_function(entry[2])
+
+# for ida_block in idaapi.FlowChart(idaapi.get_func(0x24B24)):
+#     print "%X - %X" % (ida_block.start_ea, ida_block.end_ea)
 
 deobfuscate_function(0x24B24)  # JNI_OnLoad
 # deobfuscate_function(0xF3C4)
